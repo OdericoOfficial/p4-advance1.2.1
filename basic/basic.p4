@@ -3,6 +3,7 @@
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV4 = 0x800;
+const bit<16> TYPE_ARP  = 0x0806;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -33,12 +34,25 @@ header ipv4_t {
     ip4Addr_t dstAddr;
 }
 
+header arp_t {
+    bit<16> htype;
+    bit<16> ptype;
+    bit<8>  hlen;
+    bit<8>  plen;
+    bit<16> oper; //arp operation
+    macAddr_t sha; //source mac
+    ip4Addr_t spa; //source ip
+    macAddr_t tha; //destination mac
+    ip4Addr_t tpa; //destination ip
+}
+
 struct metadata {
     /* empty */
 }
 
 struct headers {
     ethernet_t   ethernet;
+    arp_t        arp;
     ipv4_t       ipv4;
 }
 
@@ -58,9 +72,15 @@ parser MyParser(packet_in packet,
     state parse_ethernet {
         packet.extract(hdr.ethernet);
         transition select(hdr.ethernet.etherType) {
-            TYPE_IPV4: parse_ipv4;
-            default: accept;
+            TYPE_IPV4 : parse_ipv4;
+            TYPE_ARP  : parse_arp;
+            default : accept;
         }
+    }
+
+    state parse_arp {
+        packet.extract(hdr.arp);
+        transition accept;
     }
 
     state parse_ipv4 {
@@ -97,6 +117,45 @@ control MyIngress(inout headers hdr,
         hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
     }
 
+    //tha : 08:00:00:00:0x:00
+    action arp_forward(macAddr_t tha) {
+        hdr.ethernet.dstAddr = hdr.ethernet.srcAddr;
+        hdr.ethernet.srcAddr = tha;
+
+        //swap(soruce ip, destination ip)
+        ip4Addr_t temp;
+        temp = hdr.arp.spa;
+        hdr.arp.spa = hdr.arp.tpa;
+        hdr.arp.tpa = temp;
+
+        hdr.arp.tha = hdr.arp.sha;
+        hdr.arp.sha = tha;
+
+        hdr.arp.oper = 2;
+        standard_metadata.egress_spec = standard_metadata.ingress_port;
+    }
+
+    table arp_table {
+        key = {
+            hdr.arp.oper : ternary;
+            hdr.arp.tpa : exact;
+        }
+
+        actions = {
+            arp_forward;
+            drop;
+        }
+
+        const default_action = drop();
+        const entries = {
+        //(request, 10.0.x.x0) : arp_forward(08:00:00:00:0x:00)  
+          (1, 0x0A00010A) : arp_forward(0x080000000100);
+          (1, 0x0A000214) : arp_forward(0x080000000200);
+          (1, 0x0A00031E) : arp_forward(0x080000000300);
+          (1, 0x0A000428) : arp_forward(0x080000000400);
+        }
+    }
+
     table ipv4_lpm {
         key = {
             hdr.ipv4.dstAddr: lpm;
@@ -111,9 +170,13 @@ control MyIngress(inout headers hdr,
     }
 
     apply {
-        if (hdr.ipv4.isValid()) {
+
+        if (hdr.arp.isValid())
+            arp_table.apply();
+        else if (hdr.ipv4.isValid())
             ipv4_lpm.apply();
-        }
+        else
+            drop();
     }
 }
 
@@ -158,6 +221,7 @@ control MyComputeChecksum(inout headers  hdr, inout metadata meta) {
 control MyDeparser(packet_out packet, in headers hdr) {
     apply {
         packet.emit(hdr.ethernet);
+        packet.emit(hdr.arp);
         packet.emit(hdr.ipv4);
     }
 }
